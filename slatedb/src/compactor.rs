@@ -66,6 +66,7 @@ use futures::stream::BoxStream;
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
+use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 use ulid::Ulid;
 
@@ -317,6 +318,7 @@ pub struct Compactor {
     recorder: MetricsRecorderHelper,
     system_clock: Arc<dyn SystemClock>,
     fp_registry: Arc<FailPointRegistry>,
+    expected_writer_epoch: Option<u64>,
     merge_operator: Option<MergeOperatorType>,
     #[cfg(feature = "compaction_filters")]
     compaction_filter_supplier: Option<Arc<dyn CompactionFilterSupplier>>,
@@ -336,6 +338,7 @@ impl Compactor {
         system_clock: Arc<dyn SystemClock>,
         fp_registry: Arc<FailPointRegistry>,
         closed_result: Arc<dyn ClosedResultWriter>,
+        expected_writer_epoch: Option<u64>,
         merge_operator: Option<MergeOperatorType>,
         #[cfg(feature = "compaction_filters")] compaction_filter_supplier: Option<
             Arc<dyn CompactionFilterSupplier>,
@@ -359,6 +362,7 @@ impl Compactor {
             recorder: recorder.clone(),
             system_clock,
             fp_registry,
+            expected_writer_epoch,
             merge_operator,
             #[cfg(feature = "compaction_filters")]
             compaction_filter_supplier,
@@ -374,11 +378,27 @@ impl Compactor {
     /// ## Returns
     /// - `Ok(())` when the compactor task exits cleanly, or [`SlateDBError`] on failure.
     pub async fn run(&self) -> Result<(), Error> {
-        self.start().await?;
-        self.join().await
+        self.run_inner().await.map_err(Error::from)
     }
 
-    pub(crate) async fn start(&self) -> Result<(), Error> {
+    async fn run_inner(&self) -> Result<(), SlateDBError> {
+        self.start().await?;
+        self.join_inner().await
+    }
+
+    pub(crate) async fn run_until_shutdown(
+        &self,
+        shutdown: CancellationToken,
+    ) -> Result<(), SlateDBError> {
+        let run = self.run_inner();
+        tokio::pin!(run);
+        tokio::select! {
+            result = &mut run => result,
+            _ = shutdown.cancelled() => self.stop_inner().await,
+        }
+    }
+
+    pub(crate) async fn start(&self) -> Result<(), SlateDBError> {
         // The coordinator delegates compaction execution to [`crate::compaction_worker::CompactionWorker`]
         // either spawned in this process (set `worker: Some`) or running standalone (set `worker: None`).
         let (_tx, rx) = async_channel::unbounded::<CompactorMessage>();
@@ -392,16 +412,15 @@ impl Compactor {
             self.stats.clone(),
             self.system_clock.clone(),
             self.recorder.clone(),
+            self.expected_writer_epoch,
         )
         .await?;
-        self.task_executor
-            .add_handler(
-                COMPACTOR_TASK_NAME.to_string(),
-                Box::new(handler),
-                rx,
-                &Handle::current(),
-            )
-            .map_err(Error::from)?;
+        self.task_executor.add_handler(
+            COMPACTOR_TASK_NAME.to_string(),
+            Box::new(handler),
+            rx,
+            &Handle::current(),
+        )?;
 
         // Spawn an in-process worker if configured. The worker runs under its
         // own cancellation token; Compactor::stop and run() are responsible for
@@ -422,14 +441,12 @@ impl Compactor {
                 #[cfg(feature = "compaction_filters")]
                 self.compaction_filter_supplier.clone(),
             );
-            self.task_executor
-                .add_handler(
-                    crate::compaction_worker::COMPACTION_WORKER_TASK_NAME.to_string(),
-                    Box::new(worker_handler),
-                    worker_rx,
-                    &Handle::current(),
-                )
-                .map_err(Error::from)?;
+            self.task_executor.add_handler(
+                crate::compaction_worker::COMPACTION_WORKER_TASK_NAME.to_string(),
+                Box::new(worker_handler),
+                worker_rx,
+                &Handle::current(),
+            )?;
         }
 
         self.task_executor.monitor_on(&Handle::current())?;
@@ -437,17 +454,19 @@ impl Compactor {
     }
 
     pub(crate) async fn join(&self) -> Result<(), Error> {
-        self.task_executor
-            .join_task(COMPACTOR_TASK_NAME)
-            .await
-            .map_err(Error::from)?;
-        if self.options.worker.is_some() {
+        self.join_inner().await.map_err(Error::from)
+    }
+
+    async fn join_inner(&self) -> Result<(), SlateDBError> {
+        let compactor_result = self.task_executor.join_task(COMPACTOR_TASK_NAME).await;
+        let worker_result = if self.options.worker.is_some() {
             self.task_executor
                 .join_task(crate::compaction_worker::COMPACTION_WORKER_TASK_NAME)
                 .await
-                .map_err(Error::from)?;
-        }
-        Ok(())
+        } else {
+            Ok(())
+        };
+        compactor_result.and(worker_result)
     }
 
     /// Gracefully stops the compactor task and waits for it to finish.
@@ -455,17 +474,16 @@ impl Compactor {
     /// ## Returns
     /// - `Ok(())` once the task has shut down, or [`SlateDBError`] if shutdown fails.
     pub async fn stop(&self) -> Result<(), Error> {
-        self.task_executor
-            .shutdown_task(COMPACTOR_TASK_NAME)
-            .await
-            .map_err(Error::from)?;
+        self.stop_inner().await.map_err(Error::from)
+    }
+
+    async fn stop_inner(&self) -> Result<(), SlateDBError> {
+        self.task_executor.cancel_task(COMPACTOR_TASK_NAME);
         if self.options.worker.is_some() {
             self.task_executor
-                .shutdown_task(crate::compaction_worker::COMPACTION_WORKER_TASK_NAME)
-                .await
-                .map_err(Error::from)?;
+                .cancel_task(crate::compaction_worker::COMPACTION_WORKER_TASK_NAME);
         }
-        Ok(())
+        self.join_inner().await
     }
 
     /// Persist a [`CompactionSpec`] as a new [`Compaction`] in the compactions store.
@@ -583,6 +601,7 @@ impl CompactorEventHandler {
         stats: Arc<CompactionStats>,
         system_clock: Arc<dyn SystemClock>,
         recorder: MetricsRecorderHelper,
+        expected_writer_epoch: Option<u64>,
     ) -> Result<Self, SlateDBError> {
         let state_writer = CompactorStateWriter::new(
             manifest_store,
@@ -590,6 +609,7 @@ impl CompactorEventHandler {
             system_clock.clone(),
             options.as_ref(),
             rand.clone(),
+            expected_writer_epoch,
         )
         .await?;
         let compactor_epoch = state_writer.state.manifest().value.compactor_epoch;
@@ -4753,6 +4773,7 @@ mod tests {
                 compactor_stats.clone(),
                 Arc::new(DefaultSystemClock::new()),
                 MetricsRecorderHelper::noop(),
+                None,
             )
             .await
             .unwrap();
@@ -4825,6 +4846,7 @@ mod tests {
                 compactor_stats.clone(),
                 system_clock.clone(),
                 recorder.clone(),
+                None,
             )
             .await
             .unwrap();
@@ -5468,6 +5490,7 @@ mod tests {
             compactor_stats,
             system_clock,
             recorder,
+            None,
         )
         .await
         .unwrap();

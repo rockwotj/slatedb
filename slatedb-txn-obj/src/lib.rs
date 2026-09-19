@@ -463,6 +463,12 @@ impl<T: Clone, Id> SimpleTransactionalObject<T, Id> {
         self
     }
 
+    /// Adds an invariant while preserving any invariants already registered.
+    pub fn with_invariant(mut self, invariant: Invariant<T>) -> Self {
+        self.invariants.push(invariant);
+        self
+    }
+
     pub async fn init(
         store: Arc<dyn TransactionalStorageProtocol<T, Id>>,
         value: T,

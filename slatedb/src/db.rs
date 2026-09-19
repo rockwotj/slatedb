@@ -719,14 +719,6 @@ impl Db {
             warn!("failed to shutdown compactor task [error={:?}]", e);
         }
 
-        if let Err(e) = self
-            .task_executor
-            .shutdown_task(crate::compaction_worker::COMPACTION_WORKER_TASK_NAME)
-            .await
-        {
-            warn!("failed to shutdown compaction worker task [error={:?}]", e);
-        }
-
         if let Err(e) = self.task_executor.shutdown_task(GC_TASK_NAME).await {
             warn!("failed to shutdown garbage collector task [error={:?}]", e);
         }
@@ -2416,6 +2408,201 @@ mod tests {
         kv_store.delete(key).await.unwrap();
         assert_eq!(None, kv_store.get(key).await.unwrap());
         kv_store.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_background_compactor_compacts_after_open_returns() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = "/tmp/test_background_compactor_compacts_after_open_returns";
+        let should_compact = Arc::new(AtomicBool::new(false));
+        let should_compact_clone = should_compact.clone();
+        let scheduler = Arc::new(OnDemandCompactionSchedulerSupplier::new(Arc::new(
+            move |_state| should_compact_clone.swap(false, Ordering::SeqCst),
+        )));
+        let db = Db::builder(path, object_store.clone())
+            .with_settings(test_db_options(0, 1024, None))
+            .with_compactor_builder(
+                CompactorBuilder::new(path, object_store)
+                    .with_scheduler_supplier(scheduler)
+                    .with_options(fast_compactor_options()),
+            )
+            .build()
+            .await
+            .unwrap();
+
+        for i in 0..100u32 {
+            let key = format!("k{i:04}");
+            db.put(key.as_bytes(), &[0u8; 64]).await.unwrap();
+        }
+        db.flush().await.unwrap();
+        should_compact.store(true, Ordering::SeqCst);
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if !db.manifest().core().tree.compacted.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("background compactor did not compact");
+
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_background_compactor_immediate_close_is_cancellation_safe() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+        for i in 0..25 {
+            let path = format!("/tmp/test_background_compactor_immediate_close_{i}");
+            let db = Db::builder(path.as_str(), object_store.clone())
+                .with_settings(test_db_options(0, 1024, Some(fast_compactor_options())))
+                .build()
+                .await
+                .unwrap();
+
+            tokio::time::timeout(Duration::from_secs(5), db.close())
+                .await
+                .expect("close raced with compactor startup")
+                .unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_background_compactor_close_cancels_blocked_startup() {
+        let base_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = "/tmp/test_background_compactor_close_cancels_blocked_startup";
+        let initial = Db::builder(path, base_store.clone()).build().await.unwrap();
+        initial.close().await.unwrap();
+
+        let gated_store = Arc::new(GatedObjectStore::new(base_store));
+        gated_store.get_opts_gate.close();
+        gated_store.head_gate.close();
+        let object_store: Arc<dyn ObjectStore> = gated_store.clone();
+        let open = tokio::spawn(async move {
+            let mut settings = test_db_options(0, 1024, Some(fast_compactor_options()));
+            settings.flush_interval = None;
+            settings.manifest_poll_interval = Duration::from_secs(600);
+            Db::builder(path, object_store)
+                .with_settings(settings)
+                .build()
+                .await
+        });
+
+        let mut admitted_gets = 0;
+        let mut admitted_heads = 0;
+        while !open.is_finished() {
+            let get_arrivals = gated_store.get_opts_gate.arrivals();
+            if get_arrivals > admitted_gets {
+                gated_store
+                    .get_opts_gate
+                    .admit(get_arrivals - admitted_gets);
+                admitted_gets = get_arrivals;
+            }
+            let head_arrivals = gated_store.head_gate.arrivals();
+            if head_arrivals > admitted_heads {
+                gated_store.head_gate.admit(head_arrivals - admitted_heads);
+                admitted_heads = head_arrivals;
+            }
+            tokio::task::yield_now().await;
+        }
+        let db = open.await.unwrap().unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if gated_store.get_opts_gate.arrivals() > admitted_gets
+                    || gated_store.head_gate.arrivals() > admitted_heads
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("compactor startup did not reach the blocked object store");
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            db.task_executor.shutdown_task(COMPACTOR_TASK_NAME),
+        )
+        .await
+        .expect("shutdown did not cancel blocked compactor startup")
+        .unwrap();
+
+        gated_store.get_opts_gate.release();
+        gated_store.head_gate.release();
+        db.close().await.unwrap();
+    }
+
+    struct PanickingCompactionSchedulerSupplier;
+
+    impl crate::compactor::CompactionSchedulerSupplier for PanickingCompactionSchedulerSupplier {
+        fn compaction_scheduler(
+            &self,
+            _options: &CompactorOptions,
+        ) -> Box<dyn crate::compactor::CompactionScheduler + Send + Sync> {
+            panic!("injected background compactor startup failure")
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_background_compactor_startup_failure_closes_db() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = "/tmp/test_background_compactor_startup_failure_closes_db";
+        let db = Db::builder(path, object_store.clone())
+            .with_settings(test_db_options(0, 1024, None))
+            .with_compactor_builder(
+                CompactorBuilder::new(path, object_store)
+                    .with_scheduler_supplier(Arc::new(PanickingCompactionSchedulerSupplier)),
+            )
+            .build()
+            .await
+            .expect("compactor startup should be detached from DB recovery");
+        let mut status = db.subscribe();
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            status.wait_for(|status| status.close_reason.is_some()),
+        )
+        .await
+        .expect("background compactor failure did not close DB")
+        .expect("DB status channel closed unexpectedly");
+        assert_eq!(db.status().close_reason, Some(CloseReason::Panic));
+
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_background_compactor_stops_when_writer_is_fenced() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = "/tmp/test_background_compactor_stops_when_writer_is_fenced";
+        let settings = test_db_options(0, 1024, Some(fast_compactor_options()));
+        let db1 = Db::builder(path, object_store.clone())
+            .with_settings(settings.clone())
+            .build()
+            .await
+            .unwrap();
+        let mut db1_status = db1.subscribe();
+
+        let db2 = Db::builder(path, object_store)
+            .with_settings(settings)
+            .build()
+            .await
+            .unwrap();
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            db1_status.wait_for(|status| status.close_reason.is_some()),
+        )
+        .await
+        .expect("first DB did not observe fencing")
+        .expect("first DB status channel closed unexpectedly");
+        assert_eq!(db1.status().close_reason, Some(CloseReason::Fenced));
+
+        db1.close().await.unwrap();
+        db2.close().await.unwrap();
     }
 
     #[tokio::test]

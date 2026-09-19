@@ -703,6 +703,33 @@ impl MessageHandlerExecutor {
         self.add_handlers(name, vec![handler], rx, handle)
     }
 
+    /// Adds an arbitrary cancellable task to this executor.
+    pub(crate) fn add_task(
+        &self,
+        name: String,
+        task: impl FnOnce(CancellationToken) -> BoxFuture<'static, Result<(), SlateDBError>>,
+        handle: &Handle,
+    ) -> Result<(), SlateDBError> {
+        let token = CancellationToken::new();
+        let task_definition = MessageHandlerFuture {
+            name: name.clone(),
+            group_index: 0,
+            future: task(token.clone()),
+            token,
+            handle: handle.clone(),
+        };
+        let mut guard = self.futures.lock();
+        if let Some(task_definitions) = guard.as_mut() {
+            if task_definitions.iter().any(|t| t.name == name) {
+                return Err(SlateDBError::BackgroundTaskExists(name));
+            }
+            task_definitions.push(task_definition);
+            Ok(())
+        } else {
+            Err(SlateDBError::BackgroundTaskExecutorStarted)
+        }
+    }
+
     /// Adds a group of [MessageHandler]s that share a single [async_channel::Receiver].
     /// Each handler runs its own [MessageDispatcher] event loop independently, enabling
     /// parallel message processing across the group.
@@ -824,6 +851,11 @@ impl MessageHandlerExecutor {
         if let Some(entry) = self.tokens.get(name) {
             entry.value().cancel();
         }
+    }
+
+    /// Cancels every task owned by this executor.
+    pub(crate) fn cancel_all(&self) {
+        self.tokens.iter().for_each(|entry| entry.value().cancel());
     }
 
     /// Waits for a task to complete.
